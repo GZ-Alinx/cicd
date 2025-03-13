@@ -1,0 +1,176 @@
+// 版本号生成增加构建号
+def createVersion() {
+    def buildNumber = env.BUILD_NUMBER ?: '0'
+    return new Date().format('yyyyMMddHHmmss') + "_${buildNumber}"
+}
+
+// 健康检查函数
+def healthCheck(String host, int port, int timeout) {
+    def response = sh(script: """
+        for i in \$(seq 1 ${timeout}); do
+            if curl -s -f http://${host}:${port}/health > /dev/null; then
+                exit 0
+            fi
+            sleep 1
+        done
+        exit 1
+    """, returnStatus: true)
+    return response == 0
+}
+
+pipeline {
+    agent any
+
+    environment {
+        // 使用 Jenkins 凭证管理
+        HARBOR_CRED = credentials('harbor-credentials')
+        SSH_CRED = credentials('ssh-credentials')
+        _version = createVersion()
+        WEBHOOK_URL = credentials('feishu-webhook')
+        service_name = 'audio-server'
+        harbor_host = credentials('harbor-host')
+        hosts = credentials('deploy-hosts')
+        SERVICE_ENV = 'prod'
+        service_port1 = 8801
+        service_port2 = 8901
+        check_timeout = 5
+        DEPLOY_TIMEOUT = 300
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        ansiColor('xterm')
+    }
+    
+    stages {
+        stage('Pre-deploy Check') {
+            steps {
+                script {
+                    // 检查必要参数
+                    if (!harbor_host || !hosts) {
+                        error "必要的部署参数缺失"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Service') {
+            steps {
+                script {
+                    echo "开始部署服务到 Docker 容器"
+                    
+                    // 使用更安全的凭证方式登录
+                    sh """
+                        docker login ${harbor_host} -u ${HARBOR_CRED_USR} -p ${HARBOR_CRED_PSW}
+                    """
+                    
+                    // 使用 try-catch 进行错误处理
+                    try {
+                        // 拉取镜像
+                        sh "ssh -i ${SSH_CRED} root@${hosts} 'docker pull ${harbor_host}/backend/${service_name}:${_version}'"
+                        
+                        // 优雅停止旧容器
+                        sh """
+                            ssh -i ${SSH_CRED} root@${hosts} '
+                                if docker ps -q -f name=${service_name}; then
+                                    docker stop --time=30 ${service_name} || true
+                                    docker rm -f ${service_name} || true
+                                fi
+                            '
+                        """
+                        
+                        // 启动新容器
+                        sh """
+                            ssh -i ${SSH_CRED} root@${hosts} '
+                                docker run -d --name ${service_name} \
+                                    --restart=unless-stopped \
+                                    --memory=4g \
+                                    --cpu-shares=1024 \
+                                    -e environ=${SERVICE_ENV} \
+                                    -v /data/logs/${service_name}:/data/logs/${service_name} \
+                                    -p ${service_port1}:8700 \
+                                    -p ${service_port2}:8800 \
+                                    ${harbor_host}/backend/${service_name}:${_version}
+                            '
+                        """
+                        
+                        // 健康检查
+                        if (!healthCheck(hosts, service_port1, check_timeout)) {
+                            error "服务健康检查失败"
+                        }
+                    } catch (Exception e) {
+                        // 部署失败时回滚
+                        echo "部署失败，开始回滚: ${e.message}"
+                        sh "ssh -i ${SSH_CRED} root@${hosts} 'docker start ${service_name}-backup || true'"
+                        error "部署失败: ${e.message}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def committerName = sh(script: 'git log -1 --pretty=format:%an', returnStdout: true).trim()
+                def commitMessage = sh(script: 'git log -1 --pretty=format:%s', returnStdout: true).trim()
+                def message = """{
+                    "msg_type": "interactive",
+                    "card": {
+                        "header": {
+                            "title": "部署成功通知",
+                            "template": "green"
+                        },
+                        "elements": [
+                            {
+                                "tag": "div",
+                                "text": {
+                                    "content": "✅ 构建成功\\n提交者: ${committerName}\\n构建编号: #${env.BUILD_NUMBER}\\n提交信息: ${commitMessage}\\n部署版本: ${_version}\\n详情链接: ${env.BUILD_URL}",
+                                    "tag": "lark_md"
+                                }
+                            }
+                        ]
+                    }
+                }"""
+
+                sh """
+                    curl -X POST -H "Content-Type: application/json" -d '${message}' ${WEBHOOK_URL}
+                """
+            }
+        }
+        failure {
+            script {
+                def committerName = sh(script: 'git log -1 --pretty=format:%an', returnStdout: true).trim()
+                def commitMessage = sh(script: 'git log -1 --pretty=format:%s', returnStdout: true).trim()
+                def message = """{
+                    "msg_type": "interactive",
+                    "card": {
+                        "header": {
+                            "title": "部署失败警告",
+                            "template": "red"
+                        },
+                        "elements": [
+                            {
+                                "tag": "div",
+                                "text": {
+                                    "content": "❌ 构建失败\\n提交者: ${committerName}\\n构建编号: #${env.BUILD_NUMBER}\\n提交信息: ${commitMessage}\\n部署版本: ${_version}\\n详情链接: ${env.BUILD_URL}",
+                                    "tag": "lark_md"
+                                }
+                            }
+                        ]
+                    }
+                }"""
+
+                sh """
+                    curl -X POST -H "Content-Type: application/json" -d '${message}' ${WEBHOOK_URL}
+                """
+            }
+        }
+        always {
+            // 清理工作
+            sh "docker logout ${harbor_host} || true"
+            echo "部署流程完成"
+        }
+    }
+}
