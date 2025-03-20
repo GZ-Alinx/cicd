@@ -1,0 +1,147 @@
+def createVersion() {
+    def buildNumber = env.BUILD_NUMBER ?: '0'
+    return new Date().format('yyyyMMddHHmmss') + "_${buildNumber}"
+}
+
+
+pipeline {
+    agent {
+        node {
+            label 'master'
+            customWorkspace "workspace/$JOB_NAME/$BUILD_NUMBER"
+        }
+    }
+
+    environment {
+        JAVA_HOME = '/opt/jdk8u352-b08'
+        M2_HOME = '/opt/maven/maven'
+        NPM_HOME = '/opt/node-v18.20.5-linux-x64'
+        PATH = "${JAVA_HOME}/bin:$M2_HOME/bin:${NPM_HOME}/bin:${env.PATH}"
+        deploy_host01 = 'xx.xx.xx.xx'   // xxx-module-datart-biz.jar  xxx-gateway.jar
+        deploy_host02 = 'xx.xx.xx.xx' // xxx-module-system-biz.jar xxx-module-infra-biz.jar
+        telegram_chat_id = "11"
+        telegram_bot_token = "xxx"
+        git = ""
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 40, unit: 'MINUTES')
+    }
+
+    parameters {
+        choice(name: 'branch', choices: ['dev','dev_1.0.5'], description: '请选择要构建的分支')
+        choice(name: 'server', choices: ['xxx-gateway','xxx-module-datart-biz','xxx-module-infra-biz','xxx-module-system-biz'], description: '请选择要部署的服务')
+    }
+
+    stages {
+        stage('GetCode') {
+            steps {
+                checkout scmGit(branches: [[name: "*/${params.branch}"]], extensions: [], userRemoteConfigs: [[credentialsId: 'gitlab-cicd', url: "${env.git}"]])
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                        sh """
+                            set -e
+                            echo "Starting Build Process"
+                            mvn clean install -Dmaven.test.skip=true
+                        """
+                }
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                script {
+                    if (params.server == 'xxx-gateway') {
+                        sh """
+                            echo "pushing to server"
+                            scp xxx-gateway/target/xxx-gateway.jar root@${env.deploy_host01}:/opt/xxx-admin/${params.server}/
+                        """
+                    } else if (params.server == 'xxx-module-datart-biz') {
+                        sh """
+                            echo "pushing to server"
+                            scp xxx-module-datart/xxx-module-datart-biz/target/xxx-module-datart-biz.jar root@${env.deploy_host01}:/opt/xxx-admin/${params.server}/ 
+                        """
+                    } else if (params.server == 'xxx-module-infra-biz') {
+                        sh """
+                            echo "pushing to server"
+                            scp xxx-module-infra/xxx-module-infra-biz/targetxxx-module-infra-biz.jar root@${env.deploy_host02}:/opt/xxx-admin/${params.server}/
+                    """
+                    } else if (params.server == 'xxx-module-system-biz') {
+                        sh """
+                            echo "pushing to server"
+                            scp xxx-module-system/xxx-module-system-biz/target/xxx-module-system-biz.jar root@${env.deploy_host02}:/opt/xxx-admin/${params.server}/
+                        """
+                    }else {
+                        echo "Invalid server name"
+                    }
+                }
+            }
+        }
+
+        stage('RESTART SERVER') {
+            steps {
+                script {
+                    if (params.server == 'xxx') {
+                        sh """
+                            ssh root@${env.deploy_host01} "cd /opt/xxx-admin/${params.server}/ &&  systemctl restart xxx-gateway"
+                        """
+                    } else if (params.server == 'xxx') {
+                        sh """
+                            ssh root@${env.deploy_host01} "cd /opt/xxx-admin/${params.server}/ &&  systemctl restart ${params.server}"
+                        """
+                    } else if (params.server == 'xxx') {
+                        sh """
+                            ssh root@${env.deploy_host02} "cd /opt/xxx-admin/${params.server}/ &&  systemctl restart ${params.server}"
+                    """
+                    } else if (params.server == 'xxx') {
+                        sh """
+                            ssh root@${env.deploy_host02} "cd /opt/xxx-admin/${params.server}/ &&  systemctl restart ${params.server}"
+                        """
+                    }else {
+                        echo "Invalid server name"
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                echo 'Pipeline execution completed.'
+            }
+        }
+
+        success {   
+            script {
+                echo 'Build and deployment successful!'
+                sendTelegramMessage("✅ Deployment Success: Job '${env.JOB_NAME}' Build #${env.BUILD_NUMBER} deployed successfully to ${params.deploy_host}.")
+            }
+        }
+
+        failure {
+            script {
+                echo 'Build or deployment failed!'
+                sendTelegramMessage("❌ Deployment Failed: Job '${env.JOB_NAME}' Build #${env.BUILD_NUMBER} failed. Check Jenkins logs for details.")
+            }
+        }
+    }
+}
+
+def sendTelegramMessage(String message) {
+    // 使用 Telegram Bot API 发送消息
+    sh """
+        curl -s -X POST https://api.telegram.org/bot${env.telegram_bot_token}/sendMessage \
+        -H 'Content-Type: application/json' \
+        -d '{
+            "chat_id": "${env.telegram_chat_id}",
+            "text": "${message}"
+        }'
+    """
+}
